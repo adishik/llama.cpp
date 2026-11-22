@@ -629,7 +629,7 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA1) {
         switch (ncols_dst) {
             case 1:
@@ -638,6 +638,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 }
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                // fast memory: a second row per block doubles the weight bytes in flight; large Q8_0 rows are slower with it
+                if (table_id == MMVQ_PARAMETERS_GENERIC && (type != GGML_TYPE_Q8_0 || halve_iters)) {
+                    return 2;
                 }
                 return (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_RDNA1) && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
@@ -709,7 +713,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, halve_iters);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -731,6 +735,23 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
+    // the weights do not depend on the previous kernel: start fetching this block's rows before waiting on it
+    if constexpr (ncols_dst == 1) {
+        if (ids == nullptr && gridDim.y == 1 && gridDim.z == 1) {
+            constexpr int bsz = ggml_cuda_type_traits<type>::bs;
+            const size_t row_bytes = (size_t) blocks_per_row_x * bsz;
+#pragma unroll
+            for (int r = 0; r < rows_per_cuda_block; ++r) {
+                if (rows_per_cuda_block > 1 && uint32_t(row0 + r) >= stride_col_dst) {
+                    break;
+                }
+                const char * prow = (const char *) vx + (size_t) (row0 + r) * stride_row_x * bsz;
+                for (size_t off = (size_t) tid * 128; off < row_bytes; off += (size_t) nwarps * warp_size * 128) {
+                    ggml_cuda_prefetch_l2(prow + off);
+                }
+            }
+        }
+    }
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
@@ -1108,7 +1129,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, halve_iters);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1250,6 +1271,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
+        // GENERIC: short Q8_0 rows take a second row per block (long ones are slower with it)
+        if (table_id == MMVQ_PARAMETERS_GENERIC) {
+            return type == GGML_TYPE_Q8_0 && !has_ids && ncols_x <= 4096;
+        }
         if (table_id != MMVQ_PARAMETERS_GB10) {
             return false;
         }
